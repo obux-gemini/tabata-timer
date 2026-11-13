@@ -410,31 +410,66 @@ select { -webkit-appearance: none; appearance: none; padding-right: 28px; backgr
   const customSeconds = (c) => c.intervals.reduce((a, x) => a + x.d, 0) * c.repeats;
 
   // ---------- Audio ----------
-  let ctx = null;
+  // iOS keeps Web Audio silent with the ring/silent switch on and after interruptions.
+  // HTML audio elements play through the media channel, so the beeps are pre-rendered WAV clips.
+  const SOUND_DEFS = {
+    tick: [[880, 0.11]],
+    work: [[1320, 0.16], [0, 0.05], [1320, 0.32]],
+    rest: [[660, 0.42]],
+    break: [[523, 0.6]],
+    prep: [[880, 0.16]],
+    done: [[784, 0.18], [0, 0.03], [988, 0.18], [0, 0.03], [1319, 0.5]],
+    silent: [[0, 0.05]],
+  };
+  function renderWav(parts, vol = 0.7) {
+    const sr = 44100;
+    const total = Math.ceil(parts.reduce((a, p) => a + p[1], 0) * sr) + parts.length;
+    const buf = new ArrayBuffer(44 + total * 2), v = new DataView(buf);
+    const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    str(0, 'RIFF'); v.setUint32(4, 36 + total * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    str(36, 'data'); v.setUint32(40, total * 2, true);
+    let o = 44, n = 0;
+    parts.forEach(([f, len]) => {
+      const cnt = Math.ceil(len * sr);
+      for (let i = 0; i < cnt && n < total; i++, n++) {
+        let s = 0;
+        if (f) {
+          const t = i / sr;
+          const ph = (t * f) % 1;
+          const tri = 1 - 4 * Math.abs(ph - 0.5);
+          const env = Math.min(1, t / 0.008) * Math.min(1, (len - t) / 0.012) * Math.exp(-2.5 * t / len);
+          s = tri * env * vol;
+        }
+        v.setInt16(o, Math.round(Math.max(-1, Math.min(1, s)) * 32767), true); o += 2;
+      }
+    });
+    return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  }
+  const SOUND_URLS = {};
+  try { Object.keys(SOUND_DEFS).forEach(k => { SOUND_URLS[k] = renderWav(SOUND_DEFS[k]); }); } catch (e) {}
+
+  // Two players, so a countdown tick never cuts off a phase sound. Both get unlocked by the first tap.
+  const players = [];
+  let audioUnlocked = false;
   function ensureAudio() {
     try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+    if (audioUnlocked || !SOUND_URLS.silent) return;
     try {
-      if (!ctx) {
-        const AC = window.AudioContext || window.webkitAudioContext;
-        if (!AC) return;
-        ctx = new AC();
-        const b = ctx.createBuffer(1, 1, 22050);
-        const src = ctx.createBufferSource(); src.buffer = b; src.connect(ctx.destination); src.start(0);
-      }
-      if (ctx.state === 'suspended') ctx.resume();
+      for (let i = 0; i < 2; i++) { const a = new Audio(); a.preload = 'auto'; a.setAttribute('playsinline', ''); players.push(a); }
+      players.forEach(a => { a.src = SOUND_URLS.silent; a.dataset.k = 'silent'; const p = a.play(); if (p && p.catch) p.catch(() => {}); });
+      audioUnlocked = true;
     } catch (e) {}
   }
-  function beep(freq, len = 0.12, vol = 0.35, delay = 0) {
-    if (!ctx || !cfg.sound) return;
+  function playSound(key) {
+    if (!cfg.sound || players.length < 2 || !SOUND_URLS[key]) return;
+    const a = key === 'tick' ? players[0] : players[1];
     try {
-      const t0 = ctx.currentTime + delay;
-      const o = ctx.createOscillator(), g = ctx.createGain();
-      o.type = 'triangle'; o.frequency.value = freq;
-      g.gain.setValueAtTime(0.0001, t0);
-      g.gain.exponentialRampToValueAtTime(vol, t0 + 0.01);
-      g.gain.exponentialRampToValueAtTime(0.0001, t0 + len);
-      o.connect(g); g.connect(ctx.destination);
-      o.start(t0); o.stop(t0 + len + 0.02);
+      a.pause();
+      if (a.dataset.k !== key) { a.src = SOUND_URLS[key]; a.dataset.k = key; }
+      a.currentTime = 0;
+      const p = a.play(); if (p && p.catch) p.catch(() => {});
     } catch (e) {}
   }
   let voice = null, speechReady = false;
@@ -455,14 +490,15 @@ select { -webkit-appearance: none; appearance: none; padding-right: 28px; backgr
       speechSynthesis.speak(u);
     } catch (e) {}
   }
+  const SOUND_LEN = { work: 560, rest: 460, break: 640, prep: 220, done: 960 };
+  let sayTimer = null;
   function cue(seg) {
-    const t = seg ? seg.cue : 'done';
-    if (t === 'work') { beep(1320, 0.16, 0.4); beep(1320, 0.3, 0.4, 0.2); }
-    else if (t === 'rest') beep(660, 0.4, 0.35);
-    else if (t === 'break') beep(523, 0.6, 0.35);
-    else if (t === 'prep' || t === 'warm') beep(880, 0.14, 0.3);
-    else { beep(784, 0.18, 0.4); beep(988, 0.18, 0.4, 0.2); beep(1319, 0.45, 0.4, 0.4); }
-    say(seg ? seg.say : 'Geschafft!');
+    const key = seg ? (seg.cue === 'warm' ? 'prep' : seg.cue) : 'done';
+    playSound(key);
+    clearTimeout(sayTimer);
+    const text = seg ? seg.say : 'Geschafft!';
+    if (cfg.sound) sayTimer = setTimeout(() => say(text), SOUND_LEN[key] || 300);
+    else say(text);
   }
 
   // ---------- Wake lock ----------
@@ -487,10 +523,10 @@ select { -webkit-appearance: none; appearance: none; padding-right: 28px; backgr
     segEnd = now() + segs[0].d * 1000;
     cue(segs[0]); holdWake();
   }
-  function pause() { pausedLeft = Math.max(0, segEnd - now()); status = 'paused'; dropWake(); try { speechSynthesis.cancel(); } catch (e) {} }
+  function pause() { pausedLeft = Math.max(0, segEnd - now()); status = 'paused'; dropWake(); clearTimeout(sayTimer); try { speechSynthesis.cancel(); } catch (e) {} }
   function resume() { segEnd = now() + pausedLeft; status = 'running'; holdWake(); }
   function finish() { status = 'done'; idx = segs.length; cue(null); dropWake(); }
-  function reset() { status = 'idle'; plan(); idx = 0; dropWake(); try { speechSynthesis.cancel(); } catch (e) {} }
+  function reset() { status = 'idle'; plan(); idx = 0; dropWake(); clearTimeout(sayTimer); try { speechSynthesis.cancel(); } catch (e) {} }
   function skip() {
     if (status === 'running') { segEnd = now(); tick(); }
     else if (status === 'paused') {
@@ -513,7 +549,7 @@ select { -webkit-appearance: none; appearance: none; padding-right: 28px; backgr
       if (changed) { lastSec = null; cue(segs[idx]); }
       const sec = Math.ceil((segEnd - t) / 1000);
       if (sec !== lastSec) {
-        if (lastSec !== null && sec >= 1 && sec <= 3) beep(880, 0.09, 0.3);
+        if (lastSec !== null && sec >= 1 && sec <= 3) playSound('tick');
         lastSec = sec;
       }
     }
@@ -828,7 +864,7 @@ select { -webkit-appearance: none; appearance: none; padding-right: 28px; backgr
   });
   $('editBack').addEventListener('click', closeEdit);
 
-  $('optSound').addEventListener('change', (e) => { cfg.sound = e.target.checked; ensureAudio(); if (cfg.sound) beep(880, 0.1, 0.3); save(); });
+  $('optSound').addEventListener('change', (e) => { cfg.sound = e.target.checked; ensureAudio(); if (cfg.sound) playSound('tick'); save(); });
   $('optVoice').addEventListener('change', (e) => { cfg.voice = e.target.checked; unlockSpeech(); if (cfg.voice) say('Sprachansage an'); save(); });
 
   // ---------- Sheet open/close ----------

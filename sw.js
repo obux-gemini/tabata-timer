@@ -1,5 +1,5 @@
 // Offline support: network first for the page (so updates arrive), cache as fallback.
-const CACHE = 'tabata-v2';
+const CACHE = 'tabata-v3';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './apple-touch-icon.png', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
